@@ -26,7 +26,7 @@ The install script checks for all of these and offers to install any that are mi
 ## Installation
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/alderban107/hyprland-mcp/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/y-0-y-0/omarchy-mcp/main/install.sh | bash
 ```
 
 The install script handles everything automatically:
