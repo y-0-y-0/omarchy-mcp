@@ -18,14 +18,19 @@ class HyprctlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, [{"name": "test"}])
         self.assertEqual(spawn.call_args.args, ("hyprctl", "-j", "monitors"))
 
-    async def test_dispatch_reports_error_even_when_process_exits_zero(self):
-        process = AsyncMock(returncode=0)
-        process.communicate.return_value = (b'unknown dispatcher', b'')
-        with patch.object(hyprctl, "require_tool"), patch.object(
-            asyncio, "create_subprocess_exec", new=AsyncMock(return_value=process)
-        ):
+    async def test_dispatch_rejects_even_valid_commands_without_spawning(self):
+        with patch.object(asyncio, "create_subprocess_exec", new_callable=AsyncMock) as spawn:
             with self.assertRaises(HyprctlError):
                 await hyprctl.dispatch("workspace", "1")
+            spawn.assert_not_awaited()
+
+    async def test_untrusted_dispatch_never_reaches_hyprctl(self):
+        with patch.object(asyncio, "create_subprocess_exec", new_callable=AsyncMock) as spawn:
+            with self.assertRaises(HyprctlError):
+                await hyprctl.dispatch("workspace", "or os.execute('marker')")
+            with self.assertRaises(HyprctlError):
+                await hyprctl.batch(["dispatch workspace 1", "dispatch dangerous"])
+            spawn.assert_not_awaited()
 
     async def test_query_rejects_unexpected_json_type(self):
         process = AsyncMock(returncode=0)

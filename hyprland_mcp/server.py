@@ -1,17 +1,45 @@
 """Hyprland MCP server — desktop automation tools for Claude."""
 
 from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.fastmcp.exceptions import ToolError
 
 from . import hyprctl
-from .errors import check_tools
+from .errors import HyprctlError, ScreenshotError, check_tools
 
-mcp = FastMCP(
+
+DISPATCH_UNAVAILABLE = "Hyprland dispatch is unavailable: the safe Lua interface is not implemented"
+LAUNCH_UNAVAILABLE = "Application launching is unavailable: a safe launch policy is not implemented"
+
+
+class LaunchUnavailableError(Exception):
+    """Application launching is disabled until a safe policy is available."""
+
+
+class SafeFastMCP(FastMCP):
+    async def call_tool(self, name: str, arguments: dict):
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as exc:
+            cause = exc.__cause__
+            if (isinstance(cause, HyprctlError) and str(cause) == DISPATCH_UNAVAILABLE
+                    or isinstance(cause, LaunchUnavailableError) and str(cause) == LAUNCH_UNAVAILABLE):
+                raise ToolError(str(cause)) from None
+            raise ToolError("Tool failed: check arguments, argv format, and session configuration") from None
+        except Exception:
+            raise ToolError("Tool failed: check arguments, argv format, and session configuration") from None
+
+
+mcp = SafeFastMCP(
     "hyprland",
     instructions=(
         "Desktop automation server for Hyprland (Wayland). "
         "Provides screenshots, mouse/keyboard input, window management, "
         "clipboard access, and app launching. All tools wrap native Hyprland "
-        "and Wayland utilities — no X11 required."
+        "and Wayland utilities — no X11 required. Hyprland dispatch-dependent "
+        "actions and application launching are currently disabled. Mouse clicks "
+        "and scrolling without coordinates remain available. Auto-scoped OCR "
+        "falls back to the full desktop when no window is focused; captures "
+        "are non-atomic and can contain overlapping windows or other content."
     ),
 )
 
@@ -37,11 +65,12 @@ async def list_monitors() -> str:
 async def list_workspaces() -> str:
     """List all active workspaces with window counts."""
     workspaces = await hyprctl.query("workspaces")
-    workspaces.sort(key=lambda w: w["id"])
+    workspaces.sort(key=lambda w: (w.get("id") is None, w.get("id", 0), w["name"]))
     lines = []
     for w in workspaces:
+        workspace_id = f" (id={w['id']})" if "id" in w else ""
         lines.append(
-            f"- Workspace {w['name']} (id={w['id']}): "
+            f"- Workspace {w['name']}{workspace_id}: "
             f"{w['windows']} window(s), monitor {w['monitor']}"
         )
     return "\n".join(lines)
@@ -50,6 +79,8 @@ async def list_workspaces() -> str:
 @mcp.tool()
 async def switch_workspace(workspace: str) -> str:
     """Switch to a workspace by name or number.
+
+    Currently disabled because Hyprland dispatch is unavailable.
 
     Args:
         workspace: Workspace name or number (e.g. "1", "3", "special:scratchpad")
@@ -78,9 +109,11 @@ async def list_windows(workspace: int | None = None, monitor: str | None = None)
     """
     clients = await hyprctl.query("clients")
     if workspace is not None:
-        clients = [c for c in clients if c["workspace"]["id"] == workspace]
+        clients = [c for c in clients if c["workspace"].get("id") == workspace]
     if monitor is not None:
-        clients = [c for c in clients if c["monitor"] == monitor]
+        monitors = await hyprctl.query("monitors")
+        monitor_ids = {m["id"] for m in monitors if m["name"] == monitor}
+        clients = [c for c in clients if c["monitor"] in monitor_ids]
     if not clients:
         return "No windows found matching the filter."
     lines = []
@@ -112,6 +145,8 @@ async def get_active_window() -> str:
 async def focus_window(target: str) -> str:
     """Focus a window by class or title.
 
+    Currently disabled because Hyprland dispatch is unavailable.
+
     Args:
         target: Window selector — "class:firefox", "title:My Document", etc.
     """
@@ -122,6 +157,8 @@ async def focus_window(target: str) -> str:
 @mcp.tool()
 async def close_window(target: str | None = None) -> str:
     """Close a window (sends WM_CLOSE — apps can show save dialogs).
+
+    Currently disabled because Hyprland dispatch is unavailable.
 
     Args:
         target: Window selector (e.g. "class:firefox"). If omitted, closes the active window.
@@ -138,6 +175,8 @@ async def move_window(
     workspace: str | None = None,
 ) -> str:
     """Move a window to a position or workspace.
+
+    Moves are currently disabled because Hyprland dispatch is unavailable.
 
     Args:
         target: Window selector. If omitted, moves the active window.
@@ -169,6 +208,8 @@ async def resize_window(
 ) -> str:
     """Resize a window to exact pixel dimensions.
 
+    Currently disabled because Hyprland dispatch is unavailable.
+
     Args:
         width: Target width in pixels
         height: Target height in pixels
@@ -182,6 +223,8 @@ async def resize_window(
 async def toggle_fullscreen(mode: str = "fullscreen") -> str:
     """Toggle fullscreen for the active window.
 
+    Currently disabled because Hyprland dispatch is unavailable.
+
     Args:
         mode: "fullscreen" for real fullscreen, "maximize" for maximized (keeps bar)
     """
@@ -193,6 +236,8 @@ async def toggle_fullscreen(mode: str = "fullscreen") -> str:
 @mcp.tool()
 async def toggle_floating(target: str | None = None) -> str:
     """Toggle floating mode for a window.
+
+    Currently disabled because Hyprland dispatch is unavailable.
 
     Args:
         target: Window selector. If omitted, toggles the active window.
@@ -228,93 +273,12 @@ async def clipboard_write(text: str) -> str:
 
 @mcp.tool()
 async def launch_app(command: list[str] | str) -> str:
-    """Launch an owner-allowlisted argument vector without a shell.
-
-    The local owner must create $XDG_CONFIG_HOME/hyprland-mcp/launch-allowlist.json
-    (default ~/.config/hyprland-mcp/launch-allowlist.json) with exactly the form
-    {"allowed_argv": [["/usr/bin/firefox"], ["/usr/bin/example", "arg"]]}.
-    Each permitted invocation must match one complete entry. This tool never
-    creates or edits the file. Known shell, interpreter and wrapper names are
-    refused; other executables must be trusted by the owner. Limits: 128
-    arguments, 4096 UTF-8 bytes per argument, 65536 bytes total. This is not a
-    sandbox.
+    """Launch an application. Currently disabled pending a safe launch policy.
 
     Args:
-        command: Array of literal arguments, including the executable as the first
-              element. String commands are no longer supported; migrate to an array.
+        command: Application command or argument vector.
     """
-    import asyncio
-    import json
-    import os
-    import re
-    import shutil
-    from pathlib import Path
-
-    if isinstance(command, str):
-        raise ValueError("String commands are no longer supported; pass an argv array instead.")
-    argv = command
-
-    def valid_args(args: object) -> bool:
-        if not isinstance(args, list) or not args or len(args) > 128:
-            return False
-        if not all(isinstance(arg, str) and "\0" not in arg for arg in args):
-            return False
-        if not os.path.isabs(args[0]):
-            return False
-        try:
-            sizes = [len(arg.encode("utf-8")) for arg in args]
-        except UnicodeEncodeError:
-            return False
-        return all(size <= 4096 for size in sizes) and sum(sizes) <= 65536
-
-    if not valid_args(argv):
-        raise ValueError("Invalid argv: expected a nonempty array of bounded strings without NUL.")
-
-    config_home = os.environ.get("XDG_CONFIG_HOME", "")
-    if not os.path.isabs(config_home):
-        config_home = os.path.expanduser("~/.config")
-    config_path = Path(config_home) / "hyprland-mcp" / "launch-allowlist.json"
-    try:
-        with config_path.open(encoding="utf-8") as config_file:
-            config = json.load(config_file)
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        raise ValueError("Cannot read the launch allowlist.") from None
-    if (
-        not isinstance(config, dict)
-        or set(config) != {"allowed_argv"}
-        or not isinstance(config["allowed_argv"], list)
-        or not all(valid_args(entry) for entry in config["allowed_argv"])
-    ):
-        raise ValueError("Malformed launch allowlist.")
-    if argv not in config["allowed_argv"]:
-        raise ValueError("argv is not in the launch allowlist.")
-
-    # Check both the requested name and its symlink target.
-    names = {os.path.basename(argv[0]), os.path.basename(os.path.realpath(shutil.which(argv[0]) or argv[0]))}
-    blocked = re.compile(
-        r"(?:sh|bash|dash|ash|zsh|ksh|csh|tcsh|fish|env|sudo|su|doas|pkexec|"
-        r"python[0-9.]*|pypy[0-9.]*|perl[0-9.]*|ruby[0-9.]*|node|nodejs|"
-        r"php[0-9.]*|lua[0-9.]*|xargs|setsid|nohup|timeout|nice|ionice|"
-        r"stdbuf|chroot|unshare|bwrap|flatpak-spawn|systemd-run|command|exec|"
-        r"kitty|alacritty|foot|wezterm|xterm|gnome-terminal|konsole)"
-    )
-    if any(blocked.fullmatch(name) for name in names):
-        raise ValueError("Shells, interpreters, privilege tools, and wrappers cannot be launched.")
-
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *argv, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL, start_new_session=True,
-        )
-    except OSError:
-        raise RuntimeError("Could not start application") from None
-    try:
-        returncode = await asyncio.wait_for(process.wait(), timeout=0.2)
-    except asyncio.TimeoutError:
-        return "Started process (still running; later exit status unknown)"
-    if returncode != 0:
-        raise RuntimeError(f"Application exited with status {returncode}")
-    return "Launched (exited with status 0)"
+    raise LaunchUnavailableError(LAUNCH_UNAVAILABLE)
 
 
 # ── Input: Mouse ───────────────────────────────────────────────────────
@@ -323,6 +287,8 @@ async def launch_app(command: list[str] | str) -> str:
 @mcp.tool()
 async def mouse_move(x: int, y: int) -> str:
     """Move the mouse cursor to absolute layout coordinates.
+
+    Currently disabled because Hyprland dispatch is unavailable.
 
     Uses Hyprland's native movecursor — pixel-accurate, no acceleration issues.
 
@@ -344,6 +310,9 @@ async def mouse_click(
 ) -> str:
     """Click the mouse at a position (or current position if no coordinates given).
 
+    Positioned clicks are disabled because Hyprland dispatch is unavailable;
+    clicks without coordinates use the current cursor position.
+
     Args:
         button: "left", "right", or "middle"
         x: X coordinate to click at (optional — clicks at current position if omitted)
@@ -351,6 +320,10 @@ async def mouse_click(
         double: Whether to double-click
     """
     from . import input as inp
+    if (x is None) != (y is None):
+        raise ValueError("Both coordinates must be provided together")
+    if button not in ("left", "right", "middle"):
+        raise ValueError("Invalid mouse button")
     if x is not None and y is not None:
         await inp.move_cursor(x, y)
     await inp.click(button, double=double)
@@ -368,6 +341,9 @@ async def mouse_scroll(
 ) -> str:
     """Scroll the mouse wheel.
 
+    Positioned scrolling is disabled because Hyprland dispatch is unavailable;
+    scrolling without coordinates uses the current cursor position.
+
     Args:
         direction: "up" or "down"
         amount: Number of scroll steps (default 3)
@@ -375,6 +351,10 @@ async def mouse_scroll(
         y: Y coordinate to scroll at (optional)
     """
     from . import input as inp
+    if (x is None) != (y is None):
+        raise ValueError("Both coordinates must be provided together")
+    if direction not in ("up", "down") or type(amount) is not int or amount <= 0:
+        raise ValueError("Invalid scroll direction or amount")
     if x is not None and y is not None:
         await inp.move_cursor(x, y)
     await inp.scroll(direction, amount)
@@ -391,6 +371,8 @@ async def mouse_drag(
     button: str = "left",
 ) -> str:
     """Drag from one position to another.
+
+    Currently disabled because Hyprland dispatch is unavailable.
 
     Args:
         start_x: Starting X coordinate
@@ -424,6 +406,8 @@ async def type_text(text: str, delay_ms: int = 0) -> str:
 async def key_press(keys: str, target: str | None = None) -> str:
     """Press a key combination.
 
+    Currently disabled because Hyprland dispatch is unavailable.
+
     Uses Hyprland's native sendshortcut — can target specific windows without focusing them.
 
     Args:
@@ -439,6 +423,8 @@ async def key_press(keys: str, target: str | None = None) -> str:
 @mcp.tool()
 async def send_shortcut(mods: str, key: str, target: str | None = None) -> str:
     """Send a keyboard shortcut via Hyprland (can target specific windows).
+
+    Currently disabled because Hyprland dispatch is unavailable.
 
     Args:
         mods: Modifier keys (e.g. "CTRL", "SUPER SHIFT", "ALT CTRL", or "" for none)
@@ -501,24 +487,39 @@ async def _auto_scope_capture(
 ) -> tuple[bytes, int, int]:
     """Capture screenshot, auto-scoping to the active window if no scope specified.
 
-    When no monitor/window/region is given, captures just the active window
-    instead of the entire desktop. This gives OCR a smaller, higher-quality
-    image to work with — much better accuracy than a full multi-monitor capture.
+    Auto scope captures the active window's rectangle, or the full desktop if
+    no window is focused. Before/after checks are not atomic: changes that
+    revert between checks and overlapping content cannot be detected.
     """
     from . import screenshot as ss
 
-    if monitor or window or region:
+    if any(value is not None for value in (monitor, window, region)):
         return await ss.capture_raw(monitor=monitor, window=window, region=region)
 
-    # Auto-scope to active window
-    active = await hyprctl.query("activewindow")
-    if active and active.get("class"):
-        x, y = active["at"]
-        w, h = active["size"]
-        return await ss.capture_raw(region=f"{x},{y} {w}x{h}")
+    def window_state(active: dict) -> tuple | None:
+        if not active:
+            return None
+        try:
+            address = active["address"]
+            x, y = active["at"]
+            width, height = active["size"]
+            if (not isinstance(address, str) or not address or address == "0x0"
+                    or any(type(value) is not int for value in (x, y, width, height))):
+                raise ValueError
+            ss._parse_geometry(f"{x},{y} {width}x{height}")
+            return address, x, y, width, height
+        except (KeyError, TypeError, ValueError):
+            raise ScreenshotError("Cannot determine active window identity and geometry") from None
 
-    # No active window — fall back to full desktop
-    return await ss.capture_raw()
+    before = window_state(await hyprctl.query("activewindow"))
+    if before is None:
+        capture = await ss.capture_raw()
+    else:
+        _, x, y, width, height = before
+        capture = await ss.capture_raw(region=f"{x},{y} {width}x{height}")
+    if window_state(await hyprctl.query("activewindow")) != before:
+        raise ScreenshotError("Active window changed during capture")
+    return capture
 
 
 @mcp.tool()
@@ -533,6 +534,8 @@ async def find_text_on_screen(
 
     Take a screenshot, run OCR, and find all occurrences of the target text.
     Coordinates are in absolute screen space — ready to pass to mouse_click.
+    Auto scope falls back to the full desktop if no window is focused. Capture
+    checks are non-atomic and the window rectangle may include overlapping content.
 
     Args:
         target: Text to find (case-insensitive, supports multi-word)
@@ -544,7 +547,9 @@ async def find_text_on_screen(
     """
     from . import screenshot as ss, ocr
 
-    if scope == "full" and not (monitor or window or region):
+    if not target.strip() or scope not in ("auto", "full"):
+        raise ValueError("Text must be nonempty and scope must be auto or full")
+    if scope == "full" and all(value is None for value in (monitor, window, region)):
         png_bytes, origin_x, origin_y = await ss.capture_raw()
     else:
         png_bytes, origin_x, origin_y = await _auto_scope_capture(
@@ -584,7 +589,7 @@ async def click_text(
 ) -> str:
     """Find text on screen and click it — screenshot + OCR + click in one call.
 
-    By default, searches only the active window for better accuracy and speed.
+    Currently disabled because Hyprland dispatch is unavailable; no capture is performed.
 
     Args:
         target: Text to find and click (case-insensitive)
@@ -596,41 +601,11 @@ async def click_text(
         occurrence: Which match to click if multiple found (1 = first/best, 2 = second, etc.)
         scope: "auto" (default) searches the active window. "full" searches entire desktop.
     """
-    from . import screenshot as ss, ocr, input as inp
-
-    if scope == "full" and not (monitor or window or region):
-        png_bytes, origin_x, origin_y = await ss.capture_raw()
-    else:
-        png_bytes, origin_x, origin_y = await _auto_scope_capture(
-            monitor, window, region,
-        )
-
-    boxes = ocr.extract_boxes(png_bytes)
-    matches = ocr.find_text(boxes, target)
-
-    if not matches:
-        all_text = ocr.extract_text(png_bytes)
-        preview = all_text[:500] + "..." if len(all_text) > 500 else all_text
-        return f"Could not find '{target}' on screen.\n\nOCR detected text:\n{preview}"
-
-    if occurrence > len(matches):
-        return (
-            f"Only found {len(matches)} match(es) for '{target}', "
-            f"but occurrence={occurrence} requested."
-        )
-
-    match = matches[occurrence - 1]
-    screen_x = match["x"] + origin_x + match["w"] // 2
-    screen_y = match["y"] + origin_y + match["h"] // 2
-
-    await inp.move_cursor(screen_x, screen_y)
-    await inp.click(button, double=double)
-
-    kind = "Double-clicked" if double else "Clicked"
-    return (
-        f"{kind} '{match['text']}' at ({screen_x}, {screen_y}) "
-        f"[conf: {match['conf']}%]"
-    )
+    if not target.strip() or scope not in ("auto", "full") or occurrence < 1:
+        raise ValueError("Invalid text, scope, or occurrence")
+    if button not in ("left", "right", "middle"):
+        raise ValueError("Invalid mouse button")
+    raise HyprctlError(DISPATCH_UNAVAILABLE)
 
 
 @mcp.tool()
@@ -642,8 +617,7 @@ async def type_into(
 ) -> str:
     """Find a text input field, click it, type text, and optionally submit.
 
-    Combines focus + OCR + click + type + Enter into one action. Searches for
-    placeholder text in the active window to find the input field.
+    Currently disabled because Hyprland dispatch is unavailable; no capture is performed.
 
     Args:
         text: The text to type
@@ -653,69 +627,7 @@ async def type_into(
         submit: Whether to press Enter after typing (default False)
         window: Target a specific window (e.g. "class:signal"). Default: active window.
     """
-    from . import screenshot as ss, ocr, input as inp
-    import asyncio
-
-    # Focus the window if specified
-    if window:
-        await hyprctl.dispatch("focuswindow", window)
-        await asyncio.sleep(0.1)
-
-    png_bytes, origin_x, origin_y = await _auto_scope_capture(
-        None, window, None,
-    )
-
-    boxes = ocr.extract_boxes(png_bytes)
-
-    # Try to find the input field by hint text or common placeholders
-    hints = [input_hint] if input_hint else [
-        "Type a message",
-        "Message",
-        "Search",
-        "Type here",
-        "Write a message",
-        "Enter message",
-        "Say something",
-    ]
-
-    match = None
-    used_hint = None
-    for hint in hints:
-        matches = ocr.find_text(boxes, hint)
-        if matches:
-            match = matches[0]
-            used_hint = hint
-            break
-
-    if not match:
-        all_text = ocr.extract_text(png_bytes)
-        preview = all_text[:500] + "..." if len(all_text) > 500 else all_text
-        tried = ", ".join(f'"{h}"' for h in hints)
-        return (
-            f"Could not find input field. Tried: {tried}\n\n"
-            f"OCR detected text:\n{preview}"
-        )
-
-    # Click the center of the matched text
-    screen_x = match["x"] + origin_x + match["w"] // 2
-    screen_y = match["y"] + origin_y + match["h"] // 2
-
-    await inp.move_cursor(screen_x, screen_y)
-    await inp.click("left")
-    await asyncio.sleep(0.1)
-
-    # Type the text
-    await inp.type_text(text)
-
-    result = f"Found '{used_hint}' at ({screen_x},{screen_y}), typed {len(text)} chars"
-
-    # Submit if requested
-    if submit:
-        await asyncio.sleep(0.05)
-        await hyprctl.dispatch("sendshortcut", ", Return, ")
-        result += ", pressed Enter"
-
-    return result
+    raise HyprctlError(DISPATCH_UNAVAILABLE)
 
 
 @mcp.tool()
@@ -730,7 +642,9 @@ async def screenshot_with_ocr(
     """Take a screenshot AND run OCR, returning both the image and extracted text.
 
     More efficient than calling screenshot + find_text_on_screen separately.
-    The text includes screen coordinates for every detected word.
+    The returned text does not include word coordinates.
+    Auto scope falls back to the full desktop if no window is focused. Capture
+    checks are non-atomic and the window rectangle may include overlapping content.
 
     Args:
         monitor: Capture a specific monitor
@@ -742,7 +656,9 @@ async def screenshot_with_ocr(
     """
     from . import screenshot as ss, ocr
 
-    if scope == "full" and not (monitor or window or region):
+    if scope not in ("auto", "full"):
+        raise ValueError("Scope must be auto or full")
+    if scope == "full" and all(value is None for value in (monitor, window, region)):
         png_bytes, origin_x, origin_y = await ss.capture_raw()
     else:
         png_bytes, origin_x, origin_y = await _auto_scope_capture(

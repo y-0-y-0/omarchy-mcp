@@ -31,40 +31,11 @@ async def query(command: str) -> dict | list:
 
 
 async def dispatch(command: str, args: str = "") -> str:
-    """Run a hyprctl dispatch command.
-
-    Example: dispatch("focuswindow", "class:firefox")
-    """
-    require_tool("hyprctl")
-    cmd = ["hyprctl", "dispatch", command]
-    if args:
-        cmd.append(args)
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise HyprctlError("hyprctl dispatch failed")
-    if stdout.strip() != b"ok":
-        raise HyprctlError("hyprctl dispatch was not successful")
-    return "ok"
+    """Refuse legacy dispatch until a safe interface is available."""
+    # shortcut: dispatch is disabled for all versions until its active mode can be handled safely.
+    raise HyprctlError("Hyprland dispatch is unavailable: the safe Lua interface is not implemented")
 
 
 async def batch(commands: list[str]) -> str:
-    """Run multiple hyprctl dispatch commands in a batch.
-
-    Each command should be a full dispatch string like "dispatch focuswindow class:firefox".
-    """
-    require_tool("hyprctl")
-    batch_str = " ; ".join(commands)
-    proc = await asyncio.create_subprocess_exec(
-        "hyprctl", "--batch", batch_str,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise HyprctlError("hyprctl batch failed")
-    return stdout.decode().strip()
+    """Refuse unvalidated batched commands."""
+    raise HyprctlError("Hyprland batch dispatch is unavailable")
