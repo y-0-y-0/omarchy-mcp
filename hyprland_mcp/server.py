@@ -227,14 +227,94 @@ async def clipboard_write(text: str) -> str:
 
 
 @mcp.tool()
-async def launch_app(command: str) -> str:
-    """Launch an application (detached, via Hyprland).
+async def launch_app(command: list[str] | str) -> str:
+    """Launch an owner-allowlisted argument vector without a shell.
+
+    The local owner must create $XDG_CONFIG_HOME/hyprland-mcp/launch-allowlist.json
+    (default ~/.config/hyprland-mcp/launch-allowlist.json) with exactly the form
+    {"allowed_argv": [["/usr/bin/firefox"], ["/usr/bin/example", "arg"]]}.
+    Each permitted invocation must match one complete entry. This tool never
+    creates or edits the file. Known shell, interpreter and wrapper names are
+    refused; other executables must be trusted by the owner. Limits: 128
+    arguments, 4096 UTF-8 bytes per argument, 65536 bytes total. This is not a
+    sandbox.
 
     Args:
-        command: The command to run (e.g. "firefox", "kitty", "nautilus ~/Documents")
+        command: Array of literal arguments, including the executable as the first
+              element. String commands are no longer supported; migrate to an array.
     """
-    await hyprctl.dispatch("exec", command)
-    return f"Launched: {command}"
+    import asyncio
+    import json
+    import os
+    import re
+    import shutil
+    from pathlib import Path
+
+    if isinstance(command, str):
+        raise ValueError("String commands are no longer supported; pass an argv array instead.")
+    argv = command
+
+    def valid_args(args: object) -> bool:
+        if not isinstance(args, list) or not args or len(args) > 128:
+            return False
+        if not all(isinstance(arg, str) and "\0" not in arg for arg in args):
+            return False
+        if not os.path.isabs(args[0]):
+            return False
+        try:
+            sizes = [len(arg.encode("utf-8")) for arg in args]
+        except UnicodeEncodeError:
+            return False
+        return all(size <= 4096 for size in sizes) and sum(sizes) <= 65536
+
+    if not valid_args(argv):
+        raise ValueError("Invalid argv: expected a nonempty array of bounded strings without NUL.")
+
+    config_home = os.environ.get("XDG_CONFIG_HOME", "")
+    if not os.path.isabs(config_home):
+        config_home = os.path.expanduser("~/.config")
+    config_path = Path(config_home) / "hyprland-mcp" / "launch-allowlist.json"
+    try:
+        with config_path.open(encoding="utf-8") as config_file:
+            config = json.load(config_file)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError("Cannot read the launch allowlist.") from None
+    if (
+        not isinstance(config, dict)
+        or set(config) != {"allowed_argv"}
+        or not isinstance(config["allowed_argv"], list)
+        or not all(valid_args(entry) for entry in config["allowed_argv"])
+    ):
+        raise ValueError("Malformed launch allowlist.")
+    if argv not in config["allowed_argv"]:
+        raise ValueError("argv is not in the launch allowlist.")
+
+    # Check both the requested name and its symlink target.
+    names = {os.path.basename(argv[0]), os.path.basename(os.path.realpath(shutil.which(argv[0]) or argv[0]))}
+    blocked = re.compile(
+        r"(?:sh|bash|dash|ash|zsh|ksh|csh|tcsh|fish|env|sudo|su|doas|pkexec|"
+        r"python[0-9.]*|pypy[0-9.]*|perl[0-9.]*|ruby[0-9.]*|node|nodejs|"
+        r"php[0-9.]*|lua[0-9.]*|xargs|setsid|nohup|timeout|nice|ionice|"
+        r"stdbuf|chroot|unshare|bwrap|flatpak-spawn|systemd-run|command|exec|"
+        r"kitty|alacritty|foot|wezterm|xterm|gnome-terminal|konsole)"
+    )
+    if any(blocked.fullmatch(name) for name in names):
+        raise ValueError("Shells, interpreters, privilege tools, and wrappers cannot be launched.")
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL, start_new_session=True,
+        )
+    except OSError:
+        raise RuntimeError("Could not start application") from None
+    try:
+        returncode = await asyncio.wait_for(process.wait(), timeout=0.2)
+    except asyncio.TimeoutError:
+        return "Started process (still running; later exit status unknown)"
+    if returncode != 0:
+        raise RuntimeError(f"Application exited with status {returncode}")
+    return "Launched (exited with status 0)"
 
 
 # ── Input: Mouse ───────────────────────────────────────────────────────

@@ -54,11 +54,15 @@ async def click(button: str = "left", double: bool = False) -> None:
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise InputError(f"ydotool click failed: {stderr.decode().strip()}")
+        raise InputError("ydotool click failed")
 
 
 async def scroll(direction: str = "down", amount: int = 3) -> None:
     """Scroll the mouse wheel using ydotool."""
+    if direction not in ("up", "down"):
+        raise InputError("Scroll direction must be 'up' or 'down'.")
+    if type(amount) is not int or amount <= 0:
+        raise InputError("Scroll amount must be a positive integer.")
     require_tool("ydotool")
     # ydotool mousemove --wheel: positive Y = down, negative Y = up
     y_val = amount if direction == "down" else -amount
@@ -69,7 +73,7 @@ async def scroll(direction: str = "down", amount: int = 3) -> None:
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise InputError(f"ydotool scroll failed: {stderr.decode().strip()}")
+        raise InputError("ydotool scroll failed")
 
 
 async def drag(
@@ -96,21 +100,22 @@ async def drag(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    await proc.communicate()
-
-    await asyncio.sleep(0.05)
-
-    # Move to end position
-    await move_cursor(end_x, end_y)
-    await asyncio.sleep(0.05)
-
-    # Button up
-    proc = await asyncio.create_subprocess_exec(
-        "ydotool", "click", up_code,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    await proc.communicate()
+    try:
+        await proc.communicate()
+        if proc.returncode != 0:
+            raise InputError("ydotool button press failed")
+        await asyncio.sleep(0.05)
+        await move_cursor(end_x, end_y)
+        await asyncio.sleep(0.05)
+    finally:
+        proc = await asyncio.create_subprocess_exec(
+            "ydotool", "click", up_code,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        if proc.returncode != 0:
+            raise InputError("ydotool button release failed")
 
 
 async def type_text(text: str, delay_ms: int = 0) -> None:
@@ -128,7 +133,7 @@ async def type_text(text: str, delay_ms: int = 0) -> None:
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise InputError(f"wtype failed: {stderr.decode().strip()}")
+        raise InputError("wtype failed")
 
 
 async def key_press(keys: str, target: str | None = None) -> None:

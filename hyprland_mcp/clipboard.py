@@ -15,8 +15,11 @@ async def read() -> str:
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise ClipboardError(f"wl-paste failed: {stderr.decode().strip()}")
-    return stdout.decode()
+        raise ClipboardError("wl-paste failed; check the Wayland session and clipboard")
+    try:
+        return stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ClipboardError("Clipboard does not contain UTF-8 text") from None
 
 
 async def write(text: str) -> None:
@@ -29,4 +32,4 @@ async def write(text: str) -> None:
     )
     _, stderr = await proc.communicate(input=text.encode())
     if proc.returncode != 0:
-        raise ClipboardError(f"wl-copy failed: {stderr.decode().strip()}")
+        raise ClipboardError("wl-copy failed; check the Wayland session")

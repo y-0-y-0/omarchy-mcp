@@ -13,27 +13,38 @@ Built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), but wor
 - **Window management** — List, focus, close, move, resize, fullscreen, and float windows.
 - **Workspaces & monitors** — List workspaces, switch between them, query monitor layout and cursor position.
 - **Clipboard** — Read and write clipboard text.
-- **App launching** — Launch applications through Hyprland (detached, no shell expansion).
+- **App launching** — Launch locally allowlisted applications directly, without a shell.
+
+> **Compatibility:** Hyprland's Lua dispatch interface is not yet supported by
+> the window, workspace, cursor, and shortcut actions in this version. Hyprland
+> 0.57 removed legacy configuration support; those actions have not been verified
+> on it. Omarchy and fractional-scale screenshot coordinates are not verified.
 
 ## Requirements
 
 - [Hyprland](https://hyprland.org/) (Wayland compositor)
 - Python 3.10+
-- System tools: `grim`, `wtype`, `ydotool`, `wl-clipboard`, `tesseract`
+- System tools, only for the features that use them: `grim` for screenshots,
+  `wtype` for typing, `ydotool` for mouse buttons and scrolling, `wl-clipboard`
+  (`wl-copy`/`wl-paste`) for clipboard access, and `tesseract` plus language
+  data for OCR. `ydotool` also requires its daemon and access to uinput; set
+  these up according to your distribution's documentation.
 
-The install script checks for all of these and offers to install any that are missing.
+The installer reports missing tools; it does not install system packages or
+change services, device permissions, or groups.
 
 ## Installation
 
+Clone the verified repository, inspect `install.sh`, then run it:
+
 ```bash
-curl -sSL https://raw.githubusercontent.com/y-0-y-0/omarchy-mcp/main/install.sh | bash
+git clone https://github.com/y-0-y-0/omarchy-mcp.git
+cd omarchy-mcp
+./install.sh
 ```
 
-The install script handles everything automatically:
-1. Detects your package manager (pacman, apt, dnf, zypper, xbps, emerge, nix)
-2. Installs any missing system dependencies
-3. Installs hyprland-mcp via pipx
-4. Registers the MCP server with Claude Code
+The non-interactive installer uses pipx, reports optional missing tools, and
+registers with Claude Code if available without replacing an existing entry.
 
 Restart Claude Code after installing.
 
@@ -43,15 +54,15 @@ Verify with `claude mcp list` — you should see `hyprland: ✓ Connected`.
 <summary>Manual installation</summary>
 
 ```bash
-pipx install git+https://github.com/alderban107/hyprland-mcp.git
+pipx install git+https://github.com/y-0-y-0/omarchy-mcp.git
 claude mcp add --transport stdio --scope user hyprland -- hyprland-mcp
 ```
 
 Or from a local clone:
 
 ```bash
-git clone https://github.com/alderban107/hyprland-mcp.git
-cd hyprland-mcp
+git clone https://github.com/y-0-y-0/omarchy-mcp.git
+cd omarchy-mcp
 python3 -m venv .venv
 .venv/bin/pip install -e .
 claude mcp add --transport stdio --scope user hyprland -- /path/to/hyprland-mcp/.venv/bin/hyprland-mcp
@@ -116,7 +127,7 @@ claude mcp add --transport stdio --scope user hyprland -- /path/to/hyprland-mcp/
 |------|-------------|
 | `clipboard_read` | Read current clipboard text |
 | `clipboard_write` | Write text to clipboard |
-| `launch_app` | Launch an application (detached, via `hyprctl dispatch exec`) |
+| `launch_app` | Launch an application with an exact, owner-allowlisted argument array |
 
 ## How it works
 
@@ -132,7 +143,8 @@ To convert image coordinates to absolute screen coordinates:
   screen_y = image_y * 1.00 + 38
 ```
 
-This prevents the AI from using image pixel positions directly as screen coordinates — a common failure mode on multi-monitor setups where monitors have different positions in the layout.
+This mapping has not been validated for fractional scaling, rotation, or all
+multi-monitor layouts. Do not rely on it for precision input in those cases.
 
 ### OCR and dark themes
 
@@ -166,8 +178,27 @@ hyprland_mcp/
 ## Safety
 
 - `close_window` sends WM_CLOSE — apps can show "save changes?" dialogs. There is no force-kill tool.
-- `launch_app` goes through `hyprctl dispatch exec` — detached from the MCP process, no shell expansion.
-- No file system access — the MCP can see the screen and interact with it, but cannot read or write files.
+- Mouse and keyboard input and launched applications run with the user's session
+  privileges. Desktop automation can operate applications that access files;
+  it is not a sandbox.
+- `launch_app` reads only its owner-managed allowlist and executes permitted
+  argument arrays directly. Existing string commands must migrate to arrays;
+  shell operators are literal arguments, not shell syntax.
+- To enable `launch_app`, create
+  `$XDG_CONFIG_HOME/hyprland-mcp/launch-allowlist.json` (or
+  `~/.config/hyprland-mcp/launch-allowlist.json` when `XDG_CONFIG_HOME` is
+  unset) yourself, for example:
+
+  ```json
+  {"allowed_argv": [["/usr/bin/firefox"], ["/usr/bin/nautilus", "/home/user/Documents"]]}
+  ```
+
+  Every argument must match exactly, including an absolute executable path.
+  Only allow trusted applications and arguments. Common shells, interpreters,
+  wrappers, terminals and privilege tools are refused, but name checks cannot
+  identify every program capable of executing code. This is not a sandbox.
+- If a launched process is still running after a short observation, the tool
+  reports that it started but cannot know whether it will later fail.
 - Missing system tools produce clear error messages listing what to install.
 
 ## License

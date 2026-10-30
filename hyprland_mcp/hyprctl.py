@@ -13,17 +13,21 @@ async def query(command: str) -> dict | list:
     """
     require_tool("hyprctl")
     proc = await asyncio.create_subprocess_exec(
-        "hyprctl", command, "-j",
+        "hyprctl", "-j", command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise HyprctlError(f"hyprctl {command} failed: {stderr.decode().strip()}")
+        raise HyprctlError("hyprctl query failed")
     try:
-        return json.loads(stdout)
-    except json.JSONDecodeError as e:
-        raise HyprctlError(f"Failed to parse hyprctl {command} output: {e}") from e
+        result = json.loads(stdout)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HyprctlError("Invalid hyprctl JSON output") from None
+    expected = list if command in ("monitors", "clients", "workspaces") else dict
+    if not isinstance(result, expected):
+        raise HyprctlError("Unexpected hyprctl JSON output")
+    return result
 
 
 async def dispatch(command: str, args: str = "") -> str:
@@ -42,10 +46,10 @@ async def dispatch(command: str, args: str = "") -> str:
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise HyprctlError(
-            f"hyprctl dispatch {command} {args} failed: {stderr.decode().strip()}"
-        )
-    return stdout.decode().strip()
+        raise HyprctlError("hyprctl dispatch failed")
+    if stdout.strip() != b"ok":
+        raise HyprctlError("hyprctl dispatch was not successful")
+    return "ok"
 
 
 async def batch(commands: list[str]) -> str:
@@ -62,5 +66,5 @@ async def batch(commands: list[str]) -> str:
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise HyprctlError(f"hyprctl --batch failed: {stderr.decode().strip()}")
+        raise HyprctlError("hyprctl batch failed")
     return stdout.decode().strip()
