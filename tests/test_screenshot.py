@@ -59,6 +59,23 @@ class ScreenshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((x, y), (-3, 1))
         self.assertIn("-3,1 2x2", command)
 
+    async def test_reject_empty_window_selectors_before_grim(self):
+        monitors = [monitor("a", 0, 0, 2, 2)]
+        clients = [{"address": "0x1", "class": " ", "title": "Hello world",
+                    "at": [0, 0], "size": [2, 2]}]
+
+        async def query(command):
+            return monitors if command == "monitors" else clients
+
+        for window in ("", " ", "\t\n", "class:", "class: ", "class:\t\n",
+                       "title:", "title: ", "title:\t\n"):
+            with self.subTest(window=window), patch.object(screenshot, "require_tool"), patch.object(
+                screenshot.hyprctl, "query", new=AsyncMock(side_effect=query)
+            ), patch.object(asyncio, "create_subprocess_exec", new=AsyncMock()) as spawn:
+                with self.assertRaises(ScreenshotError):
+                    await screenshot.capture_raw(window=window)
+                spawn.assert_not_called()
+
     async def test_reject_invalid_scopes_and_geometry(self):
         monitors = [monitor("a", -4, 0, 4, 4)]
         for kwargs in [dict(monitor="missing"), dict(monitor="a", region="0,0 1x1"),

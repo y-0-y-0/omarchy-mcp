@@ -7,6 +7,7 @@ Text typing: wtype (only remaining wtype use)
 """
 
 import asyncio
+import os
 
 from . import hyprctl
 from .errors import InputError, require_tool
@@ -120,18 +121,38 @@ async def drag(
 
 async def type_text(text: str, delay_ms: int = 0) -> None:
     """Type text using wtype."""
+    if "\0" in text:
+        raise InputError("Text cannot contain NUL characters")
+    try:
+        data = text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise InputError("Text is not valid Unicode") from None
     require_tool("wtype")
+    # wtype decodes stdin using the C locale and may silently stop on invalid bytes.
+    env = {**os.environ, "LC_ALL": "C.UTF-8"}
+    try:
+        locale_proc = await asyncio.create_subprocess_exec(
+            "locale", "charmap", env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        charmap, _ = await locale_proc.communicate()
+    except OSError:
+        raise InputError("Unable to verify UTF-8 locale for wtype") from None
+    if locale_proc.returncode != 0 or charmap.strip().upper() != b"UTF-8":
+        raise InputError("UTF-8 locale unavailable for wtype")
     cmd = ["wtype"]
     if delay_ms > 0:
         cmd.extend(["-d", str(delay_ms)])
-    cmd.extend(["--", text])
+    cmd.append("-")
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        env=env,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr = await proc.communicate()
+    _, stderr = await proc.communicate(input=data)
     if proc.returncode != 0:
         raise InputError("wtype failed")
 

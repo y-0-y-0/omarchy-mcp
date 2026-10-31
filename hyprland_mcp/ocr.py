@@ -21,12 +21,12 @@ def _preprocess_for_ocr(img: PILImage.Image) -> PILImage.Image:
     # Convert to grayscale for analysis
     gray = img.convert("L")
 
-    # Sample the image to determine if it's dark-themed
-    # Check average brightness of a sample of pixels
-    pixels = list(gray.getdata())
-    avg_brightness = sum(pixels) / len(pixels)
+    # An exact mean with a fixed-size histogram avoids a list per image pixel.
+    histogram = gray.histogram()
+    total_brightness = sum(value * count for value, count in enumerate(histogram))
+    pixel_count = sum(histogram)
 
-    if avg_brightness < 128:
+    if total_brightness < 128 * pixel_count:
         # Dark theme — invert so text becomes dark-on-light
         gray = ImageOps.invert(gray)
 
@@ -47,7 +47,9 @@ def extract_text(image_bytes: bytes) -> str:
 def extract_boxes(image_bytes: bytes, scale: float = 1.0) -> list[dict]:
     """Run OCR and return word-level bounding boxes.
 
-    Returns list of {"text", "x", "y", "w", "h", "conf"} dicts.
+    Returns word dicts with text, x, y, w, h, conf, line_id and word_num.
+    line_id is the Tesseract (page, block, paragraph, line) identity;
+    word_num preserves the original position even when noise is filtered out.
     Coordinates are scaled back to original image coordinates if scale != 1.0.
     Filters out low-confidence noise (conf < 30).
     """
@@ -72,6 +74,9 @@ def extract_boxes(image_bytes: bytes, scale: float = 1.0) -> list[dict]:
             "w": int(data["width"][i] * inv_scale),
             "h": int(data["height"][i] * inv_scale),
             "conf": conf,
+            "line_id": (data["page_num"][i], data["block_num"][i],
+                        data["par_num"][i], data["line_num"][i]),
+            "word_num": data["word_num"][i],
         })
 
     return boxes
@@ -86,6 +91,7 @@ def find_text(
     """Find bounding boxes matching target text.
 
     Supports multi-word matching by looking at consecutive boxes on the same line.
+    Legacy boxes without OCR metadata are matched using geometry alone.
     Returns matches sorted by confidence (highest first).
     """
     target_words = target.split()
@@ -108,12 +114,29 @@ def find_text(
         span = boxes[i:i + len(target_words)]
         texts = [b["text"] if case_sensitive else b["text"].lower() for b in span]
 
-        # Check if all words match and boxes are roughly on the same line
+        # Require original OCR adjacency when metadata is available, then use
+        # geometry to reject large gaps even inside a single Tesseract line.
         if texts == target_words:
             y_values = [b["y"] for b in span]
-            if max(y_values) - min(y_values) < span[0]["h"] * 1.5:
+            same_line = max(y_values) - min(y_values) < span[0]["h"] * 1.5
+            for left, right in zip(span, span[1:]):
+                left_meta = (left.get("line_id"), left.get("word_num"))
+                right_meta = (right.get("line_id"), right.get("word_num"))
+                if left_meta != (None, None) or right_meta != (None, None):
+                    if (None in left_meta or None in right_meta
+                            or left_meta[0] != right_meta[0]
+                            or right_meta[1] != left_meta[1] + 1):
+                        same_line = False
+                        break
+                gap = max(right["x"] - (left["x"] + left["w"]),
+                          left["x"] - (right["x"] + right["w"]), 0)
+                # shortcut: large gaps can hide phrases, revisit with real OCR fixtures.
+                if gap > 6 * max(left["h"], right["h"]):
+                    same_line = False
+                    break
+            if same_line:
                 # Merge into a single bounding box
-                x = span[0]["x"]
+                x = min(b["x"] for b in span)
                 y = min(b["y"] for b in span)
                 right = max(b["x"] + b["w"] for b in span)
                 bottom = max(b["y"] + b["h"] for b in span)

@@ -33,10 +33,13 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(server.hyprctl, "query", new=query):
             result = await server.list_windows(monitor="DP-1")
             filtered = await server.list_windows(workspace=3)
+            named = await server.list_windows(workspace="notes")
         self.assertIn("wanted", result)
         self.assertNotIn("other", result)
         self.assertIn("other", filtered)
         self.assertNotIn("wanted", filtered)
+        self.assertIn("wanted", named)
+        self.assertNotIn("other", named)
 
     async def test_invalid_click_and_scroll_have_no_effect(self):
         with patch("hyprland_mcp.input.click", new_callable=AsyncMock) as click, patch(

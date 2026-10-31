@@ -80,6 +80,9 @@ def _covered(rect: tuple[int, int, int, int], monitors: list[tuple[int, int, int
 
 async def _get_window_geometry(selector: str) -> tuple[str, str]:
     """Get a window's identity and logical geometry for grim."""
+    value = selector[6:] if selector.startswith(("class:", "title:")) else selector
+    if not value.strip():
+        raise ScreenshotError("Window selector must not be empty")
     clients = await hyprctl.query("clients")
     for client in clients:
         if selector.startswith("class:"):

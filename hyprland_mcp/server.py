@@ -100,16 +100,17 @@ async def get_cursor_position() -> str:
 
 
 @mcp.tool()
-async def list_windows(workspace: int | None = None, monitor: str | None = None) -> str:
+async def list_windows(workspace: int | str | None = None, monitor: str | None = None) -> str:
     """List all open windows with class, title, size, and position.
 
     Args:
-        workspace: Filter to a specific workspace number
+        workspace: Filter by workspace ID (integer) or name (string)
         monitor: Filter to a specific monitor name
     """
     clients = await hyprctl.query("clients")
     if workspace is not None:
-        clients = [c for c in clients if c["workspace"].get("id") == workspace]
+        field = "id" if isinstance(workspace, int) else "name"
+        clients = [c for c in clients if c["workspace"].get(field) == workspace]
     if monitor is not None:
         monitors = await hyprctl.query("monitors")
         monitor_ids = {m["id"] for m in monitors if m["name"] == monitor}

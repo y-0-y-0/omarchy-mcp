@@ -45,13 +45,14 @@ Avoid `omarchy-refresh-hyprland`: it replaces user configuration.
 - [Hyprland](https://hyprland.org/) (Wayland compositor)
 - Python 3.10+
 - System tools, only for the features that use them: `grim` for screenshots,
-  `wtype` for typing, `ydotool` for mouse buttons and scrolling, `wl-clipboard`
-  (`wl-copy`/`wl-paste`) for clipboard access, and `tesseract` plus language
-  data for OCR. `ydotool` also requires its daemon and access to uinput; set
-  these up according to your distribution's documentation.
+  `wtype` and `locale` with `C.UTF-8` available for typing, `ydotool` for mouse
+  buttons and scrolling, `wl-clipboard` (`wl-copy`/`wl-paste`) for clipboard
+  access, and `tesseract` plus language data for OCR. `ydotool` also requires
+  its daemon and access to uinput; set these up according to your distribution's
+  documentation.
 
-The installer reports missing tools; it does not install system packages or
-change services, device permissions, or groups.
+The installer reports missing feature tools except `locale`; it does not install
+system packages or change services, device permissions, or groups.
 
 ## Installation
 
@@ -123,7 +124,7 @@ claude mcp add --transport stdio --scope user hyprland -- /path/to/hyprland-mcp/
 
 | Tool | Description |
 |------|-------------|
-| `list_windows` | List all windows with class, title, size, position (filterable by workspace/monitor) |
+| `list_windows` | List all windows with class, title, size, position (filterable by workspace ID or name, and monitor) |
 | `get_active_window` | Get details about the currently focused window |
 | `focus_window`, `close_window`, `move_window`, `resize_window`, `toggle_fullscreen`, `toggle_floating` | Unavailable: dispatch is disabled. |
 
