@@ -78,21 +78,33 @@ def _covered(rect: tuple[int, int, int, int], monitors: list[tuple[int, int, int
     return area == width * height
 
 
-async def _get_window_geometry(selector: str) -> tuple[str, str]:
-    """Get a window's identity and logical geometry for grim."""
+async def _get_window_geometry(
+    selector: str, monitor_data: list, monitors: dict[str, tuple[int, int, int, int]],
+) -> tuple:
+    """Get a uniquely matching window whose workspace is visible on its monitor."""
     value = selector[6:] if selector.startswith(("class:", "title:")) else selector
     if not value.strip():
         raise ScreenshotError("Window selector must not be empty")
     clients = await hyprctl.query("clients")
     for client in clients:
-        if selector.startswith("class:"):
-            matches = client["class"].lower() == selector[6:].lower()
-        elif selector.startswith("title:"):
-            matches = selector[6:].lower() in client["title"].lower()
-        else:
-            matches = client["class"].lower() == selector.lower()
+        try:
+            if selector.startswith("class:"):
+                matches = client["class"].lower() == selector[6:].lower()
+            elif selector.startswith("title:"):
+                matches = selector[6:].lower() in client["title"].lower()
+            else:
+                matches = client["class"].lower() == selector.lower()
+        except (AttributeError, KeyError, TypeError):
+            raise ScreenshotError("Cannot identify window") from None
         if matches:
             try:
+                key = "title" if selector.startswith("title:") else "class"
+                needle = value.lower()
+                candidates = [c for c in clients if (
+                    needle in c[key].lower() if key == "title" else needle == c[key].lower()
+                )]
+                if len(candidates) != 1:
+                    raise ScreenshotError("Window selector is ambiguous")
                 address = client["address"]
                 x, y = client["at"]
                 width, height = client["size"]
@@ -100,10 +112,75 @@ async def _get_window_geometry(selector: str) -> tuple[str, str]:
                         or any(type(v) is not int for v in (x, y, width, height))):
                     raise ValueError
                 geometry = f"{x},{y} {width}x{height}"
-                _parse_geometry(geometry)
-                return address, geometry
-            except (KeyError, TypeError, ValueError):
-                raise ScreenshotError("Invalid window geometry") from None
+                rect = _parse_geometry(geometry)
+                if (client["mapped"] is not True or client["hidden"] is not False
+                        or client["visible"] is not True
+                        or client["pinned"] is not False or type(client["monitor"]) is not int
+                        or client["monitor"] < 0):
+                    raise ValueError
+                matching = [m for m in monitor_data if m.get("id") == client["monitor"]]
+                if (len(matching) != 1 or type(matching[0]["id"]) is not int
+                        or matching[0].get("disabled", False) is not False):
+                    raise ValueError
+                target_monitor = matching[0]
+                if not _covered(rect, [monitors[target_monitor["name"]]]):
+                    raise ValueError
+                workspace = client["workspace"]
+                active = target_monitor["activeWorkspace"]
+                special = target_monitor["specialWorkspace"]
+                if not all(isinstance(w, dict) for w in (workspace, active, special)):
+                    raise ValueError
+                if not isinstance(workspace.get("name"), str) or not workspace["name"]:
+                    raise ValueError
+                if "address" in workspace or "type" in workspace:
+                    # 0.57+: address is an addressable workspace name, not a pointer.
+                    kind = workspace["type"]
+                    if kind not in ("normal", "special"):
+                        raise ValueError
+                    for state, expected in ((active, "normal"), (special, "special")):
+                        if (not all(isinstance(state.get(k), str) for k in ("address", "type", "name"))
+                                or ("id" in state and (type(state["id"]) is not int or state["id"] == 0))):
+                            raise ValueError
+                        if state is special and not state["address"]:
+                            if state["type"] or state["name"] or "id" in state:
+                                raise ValueError
+                        elif state["type"] != expected or not state["address"] or not state["name"]:
+                            raise ValueError
+                    current = active if kind == "normal" else special
+                    if kind == "normal" and special["address"]:
+                        raise ValueError
+                    if (not isinstance(workspace["address"], str) or not workspace["address"]
+                            or any(workspace.get(k) != current.get(k) for k in ("address", "type", "name"))
+                            or ("id" in workspace) != ("id" in current)):
+                        raise ValueError
+                    if "id" in workspace and (type(workspace["id"]) is not int
+                                               or type(current["id"]) is not int
+                                               or workspace["id"] != current["id"]):
+                        raise ValueError
+                else:
+                    # 0.56: special workspace IDs are in [-99, -2].
+                    ws_id = workspace["id"]
+                    if type(ws_id) is not int or ws_id in (-1, 0):
+                        raise ValueError
+                    if (type(active.get("id")) is not int or active["id"] in range(-99, 1)
+                            or not isinstance(active.get("name"), str) or not active["name"]
+                            or type(special.get("id")) is not int
+                            or not isinstance(special.get("name"), str)
+                            or not ((special["id"] == 0 and not special["name"])
+                                    or (-99 <= special["id"] <= -2 and special["name"]))
+                            or any("address" in state or "type" in state for state in (active, special))):
+                        raise ValueError
+                    current = special if -99 <= ws_id <= -2 else active
+                    if current is active and special["id"] != 0:
+                        raise ValueError
+                    if (type(current.get("id")) is not int or current["id"] != ws_id
+                            or current.get("name") != workspace["name"]
+                            or "address" in current or "type" in current):
+                        raise ValueError
+                # Include both workspace states so switches on this output invalidate capture.
+                return address, geometry, client["monitor"], workspace.copy(), active.copy(), special.copy()
+            except (AttributeError, KeyError, TypeError, ValueError):
+                raise ScreenshotError("Cannot verify window visibility or geometry") from None
     raise ScreenshotError("No matching window found")
 
 
@@ -122,7 +199,8 @@ async def capture_raw(
     monitor_data = await hyprctl.query("monitors")
     monitors = _monitor_rectangles(monitor_data)
     if window is not None:
-        address, geometry = await _get_window_geometry(window)
+        window_state = await _get_window_geometry(window, monitor_data, monitors)
+        geometry = window_state[1]
         rect = _parse_geometry(geometry)
     elif region is not None:
         rect = _parse_geometry(region)
@@ -170,7 +248,7 @@ async def capture_raw(
     after_state = {m["name"]: tuple(m.get(field) for field in fields) for m in after}
     if _monitor_rectangles(after) != monitors or after_state != before_state:
         raise ScreenshotError("Monitor layout changed during capture")
-    if window is not None and await _get_window_geometry(window) != (address, geometry):
+    if window is not None and await _get_window_geometry(window, after, monitors) != window_state:
         raise ScreenshotError("Window identity or geometry changed during capture")
     return stdout, x, y
 

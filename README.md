@@ -166,6 +166,15 @@ cannot detect transient changes that revert. These checks are based on simulated
 fractional scaling, rotation, and multi-monitor layouts have not been validated
 on a real desktop. Do not rely on the mapping for precision input.
 
+Window selectors are rejected if the matched window's workspace cannot be
+verified as active on its monitor before and after capture, or if more than one
+window matches. Use a more specific title when a class is ambiguous. A normal
+window is also rejected while a special workspace is open on its monitor.
+Pinned windows and windows spanning monitors are not supported by window-scoped
+capture. This is still a screen rectangle, not an isolated window surface:
+overlapping windows, transparency, animations, and transient workspace changes
+may reveal other content. Do not use it as a privacy or isolation boundary.
+
 ### OCR and dark themes
 
 Tesseract OCR was designed for black text on white paper. Most desktop apps use dark themes, which tanks OCR accuracy. hyprland-mcp automatically detects dark-background screenshots and inverts them before running OCR, significantly improving text detection.
