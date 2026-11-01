@@ -27,6 +27,21 @@ class ClipboardTests(unittest.IsolatedAsyncioTestCase):
                 await clipboard.read()
         self.assertNotIn("secret clipboard data", str(error.exception))
 
+    async def test_invalid_unicode_is_rejected_before_starting_wl_copy(self):
+        launch = AsyncMock()
+        with patch.object(clipboard, "require_tool"), patch.object(
+            asyncio, "create_subprocess_exec", new=launch
+        ):
+            try:
+                await clipboard.write("secret\ud800")
+            except Exception as error:
+                caught = error
+            else:
+                self.fail("Invalid Unicode should be rejected")
+        launch.assert_not_awaited()
+        self.assertIsInstance(caught, ClipboardError)
+        self.assertNotIn("secret", str(caught))
+
 
 if __name__ == "__main__":
     unittest.main()

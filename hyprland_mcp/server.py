@@ -1,5 +1,8 @@
 """Hyprland MCP server — desktop automation tools for Claude."""
 
+import asyncio
+from weakref import WeakValueDictionary
+
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -483,6 +486,34 @@ async def screenshot(
 # ── OCR & Smart Actions ────────────────────────────────────────────────
 
 
+# Keep locks only while OCR is active or queued on their event loop.
+_ocr_locks: WeakValueDictionary = WeakValueDictionary()
+
+
+def _ocr_lock():
+    loop = asyncio.get_running_loop()
+    lock = _ocr_locks.get(loop)
+    if lock is None:
+        lock = _ocr_locks[loop] = asyncio.Lock()
+    return lock
+
+
+async def _run_ocr(func, *args):
+    task = asyncio.create_task(asyncio.to_thread(func, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Keep admission until the thread finishes, even under repeated cancellation.
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        if not task.cancelled():
+            task.result()
+        raise
+
+
 async def _auto_scope_capture(
     monitor: str | None, window: str | None, region: str | None,
 ) -> tuple[bytes, int, int]:
@@ -550,31 +581,32 @@ async def find_text_on_screen(
 
     if not target.strip() or scope not in ("auto", "full"):
         raise ValueError("Text must be nonempty and scope must be auto or full")
-    if scope == "full" and all(value is None for value in (monitor, window, region)):
-        png_bytes, origin_x, origin_y = await ss.capture_raw()
-    else:
-        png_bytes, origin_x, origin_y = await _auto_scope_capture(
-            monitor, window, region,
-        )
+    async with _ocr_lock():
+        if scope == "full" and all(value is None for value in (monitor, window, region)):
+            png_bytes, origin_x, origin_y = await ss.capture_raw()
+        else:
+            png_bytes, origin_x, origin_y = await _auto_scope_capture(
+                monitor, window, region,
+            )
 
-    boxes = ocr.extract_boxes(png_bytes)
-    matches = ocr.find_text(boxes, target)
+        boxes = await _run_ocr(ocr.extract_boxes, png_bytes)
+        matches = ocr.find_text(boxes, target)
 
-    if not matches:
-        all_text = ocr.extract_text(png_bytes)
-        preview = all_text[:500] + "..." if len(all_text) > 500 else all_text
-        return f"Text '{target}' not found.\n\nOCR detected text:\n{preview}"
+        if not matches:
+            all_text = await _run_ocr(ocr.extract_text, png_bytes)
+            preview = all_text[:500] + "..." if len(all_text) > 500 else all_text
+            return f"Text '{target}' not found.\n\nOCR detected text:\n{preview}"
 
-    lines = [f"Found {len(matches)} match(es) for '{target}':"]
-    for m in matches:
-        screen_x = m["x"] + origin_x + m["w"] // 2
-        screen_y = m["y"] + origin_y + m["h"] // 2
-        lines.append(
-            f"- \"{m['text']}\" at screen ({screen_x}, {screen_y}) "
-            f"[box: {m['x']+origin_x},{m['y']+origin_y} {m['w']}x{m['h']}, "
-            f"conf: {m['conf']}%]"
-        )
-    return "\n".join(lines)
+        lines = [f"Found {len(matches)} match(es) for '{target}':"]
+        for m in matches:
+            screen_x = m["x"] + origin_x + m["w"] // 2
+            screen_y = m["y"] + origin_y + m["h"] // 2
+            lines.append(
+                f"- \"{m['text']}\" at screen ({screen_x}, {screen_y}) "
+                f"[box: {m['x']+origin_x},{m['y']+origin_y} {m['w']}x{m['h']}, "
+                f"conf: {m['conf']}%]"
+            )
+        return "\n".join(lines)
 
 
 @mcp.tool()
@@ -659,17 +691,23 @@ async def screenshot_with_ocr(
 
     if scope not in ("auto", "full"):
         raise ValueError("Scope must be auto or full")
-    if scope == "full" and all(value is None for value in (monitor, window, region)):
-        png_bytes, origin_x, origin_y = await ss.capture_raw()
-    else:
-        png_bytes, origin_x, origin_y = await _auto_scope_capture(
-            monitor, window, region,
-        )
+    # Keep these checks in sync with screenshot.resize_and_compress.
+    if type(max_width) is not int or not 1 <= max_width <= 32767:
+        raise ScreenshotError("max_width must be between 1 and 32767")
+    if type(quality) is not int or not 1 <= quality <= 100:
+        raise ScreenshotError("quality must be between 1 and 100")
+    async with _ocr_lock():
+        if scope == "full" and all(value is None for value in (monitor, window, region)):
+            png_bytes, origin_x, origin_y = await ss.capture_raw()
+        else:
+            png_bytes, origin_x, origin_y = await _auto_scope_capture(
+                monitor, window, region,
+            )
 
-    text = ocr.extract_text(png_bytes)
-    image, _ = ss.resize_and_compress(png_bytes, max_width=max_width, quality=quality)
+        text = await _run_ocr(ocr.extract_text, png_bytes)
+        image, _ = ss.resize_and_compress(png_bytes, max_width=max_width, quality=quality)
 
-    return [image, f"OCR text:\n{text}"]
+        return [image, f"OCR text:\n{text}"]
 
 
 # ── Entry Point ────────────────────────────────────────────────────────

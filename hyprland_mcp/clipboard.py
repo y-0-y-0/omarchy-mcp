@@ -25,11 +25,15 @@ async def read() -> str:
 async def write(text: str) -> None:
     """Write text to clipboard."""
     require_tool("wl-copy")
+    try:
+        data = text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ClipboardError("Clipboard text is not valid UTF-8") from None
     proc = await asyncio.create_subprocess_exec(
         "wl-copy",
         stdin=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr = await proc.communicate(input=text.encode())
+    _, stderr = await proc.communicate(input=data)
     if proc.returncode != 0:
         raise ClipboardError("wl-copy failed; check the Wayland session")

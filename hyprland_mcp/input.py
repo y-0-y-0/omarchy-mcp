@@ -8,9 +8,13 @@ Text typing: wtype (only remaining wtype use)
 
 import asyncio
 import os
+from weakref import WeakValueDictionary
 
 from . import hyprctl
 from .errors import InputError, require_tool
+
+# Locks are scoped to an event loop and retained only while typing is active or queued.
+_typing_locks: WeakValueDictionary = WeakValueDictionary()
 
 # ydotool button codes (hex, with 0xC0 = down+up mask)
 _BUTTON_MAP = {
@@ -145,16 +149,38 @@ async def type_text(text: str, delay_ms: int = 0) -> None:
         cmd.extend(["-d", str(delay_ms)])
     cmd.append("-")
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        env=env,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate(input=data)
-    if proc.returncode != 0:
-        raise InputError("wtype failed")
+    loop = asyncio.get_running_loop()
+    lock = _typing_locks.get(loop)
+    if lock is None:
+        lock = _typing_locks[loop] = asyncio.Lock()
+    async with lock:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await proc.communicate(input=data)
+        except asyncio.CancelledError:
+            async def cleanup():
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    await proc.wait()
+                await proc.communicate()
+
+            cleanup_task = asyncio.create_task(cleanup())
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    continue
+            cleanup_task.result()
+            raise
+        if proc.returncode != 0:
+            raise InputError("wtype failed")
 
 
 async def key_press(keys: str, target: str | None = None) -> None:

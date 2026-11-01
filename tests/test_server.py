@@ -1,4 +1,7 @@
+import asyncio
+import contextvars
 import sys
+import threading
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -104,6 +107,214 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await server.find_text_on_screen("  ")
             capture.assert_not_awaited()
+
+    async def test_other_task_progresses_during_ocr(self):
+        box = {"text": "example", "x": 1, "y": 2, "w": 4, "h": 6, "conf": 90}
+        for case in ("boxes", "fallback", "screenshot"):
+            with self.subTest(case=case):
+                started = threading.Event()
+                release = threading.Event()
+                finished = threading.Event()
+
+                def slow_ocr(value):
+                    started.set()
+                    release.wait(timeout=2)
+                    finished.set()
+                    return [box] if case == "boxes" else "detected"
+
+                with patch("hyprland_mcp.screenshot.capture_raw", new_callable=AsyncMock,
+                           return_value=(b"png", 10, 20)), patch(
+                    "hyprland_mcp.screenshot.resize_and_compress", return_value=("image", None)
+                ), patch("hyprland_mcp.ocr.extract_boxes", side_effect=(
+                    slow_ocr if case == "boxes" else lambda value: []
+                )), patch("hyprland_mcp.ocr.extract_text", side_effect=slow_ocr):
+                    if case == "screenshot":
+                        task = asyncio.create_task(server.screenshot_with_ocr(scope="full"))
+                    else:
+                        task = asyncio.create_task(server.find_text_on_screen("example", scope="full"))
+                    try:
+                        while not started.is_set() and not task.done():
+                            await asyncio.sleep(0.001)
+                        progressed_during_ocr = started.is_set() and not finished.is_set()
+                    finally:
+                        release.set()
+                        result = await task
+
+                self.assertTrue(progressed_during_ocr, "another task could not run during OCR")
+                if case == "boxes":
+                    self.assertIn('"example" at screen (13, 25)', result)
+                elif case == "fallback":
+                    self.assertIn("OCR detected text:\ndetected", result)
+                else:
+                    self.assertEqual(result, ["image", "OCR text:\ndetected"])
+
+    async def test_ocr_inherits_request_context(self):
+        context = contextvars.ContextVar("ocr_test_context", default="missing")
+        seen = []
+
+        def extract_boxes(image):
+            seen.append(context.get())
+            return []
+
+        def extract_text(image):
+            seen.append(context.get())
+            return "detected"
+
+        with patch("hyprland_mcp.screenshot.capture_raw", new_callable=AsyncMock,
+                   return_value=(b"png", 0, 0)), patch(
+            "hyprland_mcp.screenshot.resize_and_compress", return_value=("image", None)
+        ), patch("hyprland_mcp.ocr.extract_boxes", side_effect=extract_boxes), patch(
+            "hyprland_mcp.ocr.extract_text", side_effect=extract_text
+        ):
+            token = context.set("request")
+            try:
+                await server.find_text_on_screen("example", scope="full")
+                await server.screenshot_with_ocr(scope="full")
+            finally:
+                context.reset(token)
+        self.assertEqual(seen, ["request", "request", "request"])
+
+    async def test_ocr_admission_precedes_capture_even_after_cancellation(self):
+        for case in ("boxes", "fallback", "screenshot"):
+            with self.subTest(case=case):
+                loop = asyncio.get_running_loop()
+                started = asyncio.Event()
+                release = threading.Event()
+                calls = []
+                box = {"text": "example", "x": 0, "y": 0, "w": 2, "h": 2, "conf": 90}
+
+                async def capture():
+                    calls.append(len(calls) + 1)
+                    return str(calls[-1]).encode(), 0, 0
+
+                def block():
+                    loop.call_soon_threadsafe(started.set)
+                    release.wait()
+
+                def boxes(image):
+                    if image == b"1" and case == "boxes":
+                        block()
+                    return [] if image == b"1" and case == "fallback" else [box]
+
+                def text(image):
+                    if image == b"1":
+                        block()
+                    return "detected"
+
+                with patch("hyprland_mcp.screenshot.capture_raw", new=capture), patch(
+                    "hyprland_mcp.screenshot.resize_and_compress", return_value=("image", None)
+                ), patch("hyprland_mcp.ocr.extract_boxes", side_effect=boxes), patch(
+                    "hyprland_mcp.ocr.extract_text", side_effect=text
+                ):
+                    first = asyncio.create_task(
+                        server.screenshot_with_ocr(scope="full") if case == "screenshot"
+                        else server.find_text_on_screen("example", scope="full")
+                    )
+                    waiting = []
+                    try:
+                        await asyncio.wait_for(started.wait(), 2)
+                        waiting = [
+                            asyncio.create_task(server.screenshot_with_ocr(scope="full")),
+                            asyncio.create_task(server.find_text_on_screen("example", scope="full")),
+                            asyncio.create_task(server.screenshot_with_ocr(scope="full")),
+                        ]
+                        await asyncio.sleep(0)
+                        first.cancel()
+                        await asyncio.sleep(0)
+                        first.cancel()
+                        await asyncio.sleep(0)
+                        waiting[0].cancel()
+                        waiting[0].cancel()
+                        await asyncio.gather(waiting[0], return_exceptions=True)
+                        await asyncio.sleep(0)
+                        self.assertFalse(first.done())
+                        self.assertEqual(calls, [1], "waiting requests captured before OCR finished")
+                        self.assertTrue(all(not task.done() for task in waiting[1:]))
+                    finally:
+                        release.set()
+                        results = await asyncio.gather(first, *waiting, return_exceptions=True)
+                    self.assertIsInstance(results[0], asyncio.CancelledError)
+                    self.assertIsInstance(results[1], asyncio.CancelledError)
+                    self.assertFalse(any(isinstance(result, BaseException) for result in results[2:]))
+                    self.assertEqual(len(calls), 3)
+
+    async def test_ocr_admission_released_on_capture_and_ocr_errors(self):
+        with patch("hyprland_mcp.screenshot.capture_raw", new_callable=AsyncMock,
+                   side_effect=[RuntimeError("capture"), (b"png", 0, 0), (b"png", 0, 0)]), patch(
+            "hyprland_mcp.screenshot.resize_and_compress", return_value=("image", None)
+        ), patch("hyprland_mcp.ocr.extract_text", side_effect=[RuntimeError("ocr"), "detected"]):
+            with self.assertRaisesRegex(RuntimeError, "capture"):
+                await server.screenshot_with_ocr(scope="full")
+            with self.assertRaisesRegex(RuntimeError, "ocr"):
+                await server.screenshot_with_ocr(scope="full")
+            self.assertEqual(await server.screenshot_with_ocr(scope="full"), ["image", "OCR text:\ndetected"])
+
+    async def test_cancelled_ocr_error_does_not_block_next_request(self):
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+
+        def extract_text(image):
+            if started.is_set():
+                return "detected"
+            loop.call_soon_threadsafe(started.set)
+            release.wait()
+            raise RuntimeError("ocr")
+
+        with patch("hyprland_mcp.screenshot.capture_raw", new_callable=AsyncMock,
+                   return_value=(b"png", 0, 0)), patch(
+            "hyprland_mcp.screenshot.resize_and_compress", return_value=("image", None)
+        ), patch("hyprland_mcp.ocr.extract_text", side_effect=extract_text):
+            first = asyncio.create_task(server.screenshot_with_ocr(scope="full"))
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                first.cancel()
+                await asyncio.sleep(0)
+                first.cancel()
+            finally:
+                release.set()
+                result = await asyncio.gather(first, return_exceptions=True)
+            self.assertIsInstance(result[0], RuntimeError)
+            self.assertEqual(str(result[0]), "ocr")
+            self.assertEqual(await server.screenshot_with_ocr(scope="full"), ["image", "OCR text:\ndetected"])
+
+    async def test_screenshot_ocr_rejects_invalid_image_options_before_capture(self):
+        cases = [
+            ("max_width", 0, "max_width must be between 1 and 32767"),
+            ("max_width", 32768, "max_width must be between 1 and 32767"),
+            ("max_width", True, "max_width must be between 1 and 32767"),
+            ("max_width", 1.5, "max_width must be between 1 and 32767"),
+            ("quality", 0, "quality must be between 1 and 100"),
+            ("quality", 101, "quality must be between 1 and 100"),
+            ("quality", True, "quality must be between 1 and 100"),
+            ("quality", 1.5, "quality must be between 1 and 100"),
+        ]
+        for scope in ("auto", "full"):
+            for field, value, message in cases:
+                with self.subTest(scope=scope, field=field, value=value), patch(
+                    "hyprland_mcp.screenshot.capture_raw", new_callable=AsyncMock,
+                    return_value=(b"png", 0, 0),
+                ) as capture, patch.object(
+                    server.hyprctl, "query", new_callable=AsyncMock, return_value={}
+                ) as query, patch("hyprland_mcp.ocr.extract_text", return_value="text") as text:
+                    with self.assertRaisesRegex(server.ScreenshotError, f"^{message}$"):
+                        await server.screenshot_with_ocr(scope=scope, **{field: value})
+                    capture.assert_not_awaited()
+                    query.assert_not_awaited()
+                    text.assert_not_called()
+
+    async def test_screenshot_ocr_accepts_image_option_boundaries(self):
+        with patch("hyprland_mcp.screenshot.capture_raw", new_callable=AsyncMock,
+                   return_value=(b"png", 0, 0)), patch(
+            "hyprland_mcp.screenshot.resize_and_compress", return_value=("image", None)
+        ) as resize, patch("hyprland_mcp.ocr.extract_text", return_value="text"):
+            for max_width, quality in ((1, 1), (32767, 100)):
+                with self.subTest(max_width=max_width, quality=quality):
+                    result = await server.screenshot_with_ocr(
+                        scope="full", max_width=max_width, quality=quality,
+                    )
+                    self.assertEqual(result, ["image", "OCR text:\ntext"])
+                    resize.assert_called_with(b"png", max_width=max_width, quality=quality)
 
     async def test_ocr_empty_explicit_scopes_are_not_expanded(self):
         async def query(command):
